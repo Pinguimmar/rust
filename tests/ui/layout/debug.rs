@@ -16,6 +16,29 @@ union U { f1: (i32, i32), f3: i32 } //~ ERROR: layout_of
 #[rustc_dump_layout(debug)]
 type Test = Result<i32, i32>; //~ ERROR: layout_of
 
+enum InnerForDebug {
+    A(u32),
+    B(u32),
+}
+
+#[rustc_dump_layout(debug)]
+enum SplitAroundNestedNicheForDebug { //~ ERROR: layout_of
+    A(InnerForDebug),
+    B(u32, u8),
+}
+
+enum Inner16ForDebug {
+    A(u16),
+    B(u16),
+}
+
+#[rustc_dump_layout(debug)]
+enum ThreeVariantSplitAroundNestedNicheForDebug { //~ ERROR: layout_of
+    A(Inner16ForDebug),
+    B(u16, u8),
+    C(u8, u8),
+}
+
 #[rustc_dump_layout(debug)]
 type T = impl std::fmt::Debug; //~ ERROR: layout_of
 #[define_opaque(T)]
@@ -94,3 +117,6 @@ type OptBool = Option<bool>; //~ ERROR: layout_of
 
 #[rustc_dump_layout(debug)]
 type OptChar = Option<char>; //~ ERROR: layout_of
+
+#[rustc_dump_layout(debug)]
+type OptI32 = Option<i32>; //~ ERROR: layout_of

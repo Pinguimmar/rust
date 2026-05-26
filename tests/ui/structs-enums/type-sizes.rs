@@ -146,6 +146,60 @@ enum NicheWithData {
     D(u32, u32),
 }
 
+enum NestedInnerNiche {
+    A(u32),
+    B(u32),
+}
+
+enum SplitAroundNestedNiche {
+    A(NestedInnerNiche),
+    B(u32, u8),
+}
+
+enum SplitAroundNestedNicheFieldsReversed {
+    A(NestedInnerNiche),
+    B(u8, u32),
+}
+
+enum SplitAroundNestedNicheVariantsReversed {
+    A(u32, u8),
+    B(NestedInnerNiche),
+}
+
+enum ThreeVariantSplitAroundNestedNiche {
+    A(NestedInnerNiche),
+    B(u32, u8),
+    C(u16, u16, u8),
+}
+
+enum NestedInnerNiche16 {
+    A(u16),
+    B(u16),
+}
+
+enum SplitAroundNestedNiche16 {
+    A(NestedInnerNiche16),
+    B(u16, u8),
+    C(u8, u8),
+}
+
+enum MixedNestedInnerNiche {
+    A(u16, u8),
+    B(u32),
+    C(u8),
+}
+
+enum SplitAroundMixedNestedNiche {
+    A(MixedNestedInnerNiche),
+    B(u16, u16, u8),
+}
+
+#[repr(C)]
+enum ReprCSplitAroundNestedNiche {
+    A(NestedInnerNiche),
+    B(u32, u8),
+}
+
 // A type with almost 2^16 invalid values.
 #[repr(u16)]
 pub enum NicheU16 {
@@ -307,6 +361,16 @@ pub fn main() {
         size_of::<Option<Option2<&(), Option<NicheWithData>>>>(),
         size_of::<(&(), NicheWithData)>()
     );
+    assert_eq!(size_of::<NestedInnerNiche>(), 8);
+    assert_eq!(size_of::<SplitAroundNestedNiche>(), 8);
+    assert_eq!(size_of::<SplitAroundNestedNicheFieldsReversed>(), 8);
+    assert_eq!(size_of::<SplitAroundNestedNicheVariantsReversed>(), 8);
+    assert_eq!(size_of::<ThreeVariantSplitAroundNestedNiche>(), 8);
+    assert_eq!(size_of::<NestedInnerNiche16>(), 4);
+    assert_eq!(size_of::<SplitAroundNestedNiche16>(), 4);
+    assert_eq!(size_of::<MixedNestedInnerNiche>(), 8);
+    assert_eq!(size_of::<SplitAroundMixedNestedNiche>(), 8);
+    assert_eq!(size_of::<ReprCSplitAroundNestedNiche>(), 12);
 
     pub enum FillPadding { A(NonZero<u8>, u32), B }
     assert_eq!(size_of::<FillPadding>(), 8);

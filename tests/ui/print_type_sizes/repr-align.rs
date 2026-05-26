@@ -23,6 +23,15 @@ enum E {
     B(A)
 }
 
+#[repr(align(8))]
+#[derive(Default)]
+struct B(i32);
+
+enum F {
+    A(i32, i8),
+    B(B)
+}
+
 #[derive(Default)]
 pub struct S {
     a: i32,

@@ -617,7 +617,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
 
             let largest_variant_index = variant_layouts
                 .iter_enumerated()
-                .max_by_key(|(_i, layout)| layout.size.bytes())
+                .max_by_key(|(_i, layout)| (layout.largest_niche.is_some(), layout.size.bytes()))
                 .map(|(i, _layout)| i)?;
 
             let all_indices = variants.indices();
@@ -653,7 +653,40 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                 let this_offset = (niche_offset + niche_size).align_to(this_align);
 
                 if this_offset + layout.size > size {
-                    return false;
+                    let FieldsShape::Arbitrary { ref mut offsets, ref in_memory_order } =
+                        layout.fields
+                    else {
+                        panic!("Layout of fields should be Arbitrary for variants")
+                    };
+
+                    let mut next_offset = Size::ZERO;
+                    for &field_idx in in_memory_order.iter() {
+                        let field = &variants[i][field_idx];
+                        let field_align = field.align.abi;
+                        let field_size = field.size;
+                        next_offset = next_offset.align_to(field_align);
+
+                        if field_size > Size::ZERO
+                            && next_offset < niche_offset + niche_size
+                            && next_offset + field_size > niche_offset
+                        {
+                            next_offset = (niche_offset + niche_size).align_to(field_align);
+                        }
+
+                        offsets[field_idx] = next_offset;
+                        next_offset += field_size;
+                    }
+
+                    layout.size = next_offset.align_to(layout.align.abi);
+                    if layout.size > size {
+                        return false;
+                    }
+
+                    if !layout.is_uninhabited() {
+                        layout.backend_repr = BackendRepr::Memory { sized: true };
+                    }
+
+                    return true;
                 }
 
                 // It'll fit, but we need to make some adjustments.
@@ -1085,6 +1118,223 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             max_repr_align,
             unadjusted_abi_align,
             randomization_seed: combined_seed,
+        };
+
+        let tag_at_end_layout = || -> Option<LayoutData<FieldIdx, VariantIdx>> {
+            if repr.inhibit_enum_layout_opt() {
+                return None;
+            }
+
+            let tail_tag_mask = min_ity.size().unsigned_int_max();
+            let tail_tag = Scalar::Initialized {
+                value: Primitive::Int(min_ity, signed),
+                valid_range: WrappingRange {
+                    start: (min as u128 & tail_tag_mask),
+                    end: (max as u128 & tail_tag_mask),
+                },
+            };
+
+            let mut align = dl.aggregate_align.max(tail_tag.align(dl).abi);
+            let mut max_repr_align = repr.align;
+            let mut unadjusted_abi_align = align;
+            let mut tag_offset = Size::ZERO;
+
+            let mut layout_variants = variants
+                .iter_enumerated()
+                .map(|(i, field_layouts)| {
+                    let mut st =
+                        self.univariant(field_layouts, repr, StructKind::AlwaysSized).ok()?;
+                    st.variants = Variants::Single { index: i };
+                    tag_offset = cmp::max(tag_offset, st.size);
+                    align = align.max(st.align.abi);
+                    max_repr_align = max_repr_align.max(st.max_repr_align);
+                    unadjusted_abi_align = unadjusted_abi_align.max(st.unadjusted_abi_align);
+                    Some(st)
+                })
+                .collect::<Option<IndexVec<VariantIdx, _>>>()?;
+
+            tag_offset = tag_offset.align_to(tail_tag.align(dl).abi);
+            let size = (tag_offset + tail_tag.size(dl)).align_to(align);
+            if size > tagged_layout.size {
+                return None;
+            }
+
+            let min_variant_size = tag_offset + tail_tag.size(dl);
+            for variant in &mut layout_variants {
+                if variant.size < min_variant_size {
+                    variant.size = min_variant_size;
+                    if !variant.is_uninhabited() {
+                        variant.backend_repr = BackendRepr::Memory { sized: true };
+                    }
+                }
+            }
+
+            let mut abi = BackendRepr::Memory { sized: true };
+            let mut common_prim = None;
+            let mut common_prim_initialized_in_all_variants = true;
+            for (field_layouts, layout_variant) in iter::zip(variants, &layout_variants) {
+                let FieldsShape::Arbitrary { ref offsets, .. } = layout_variant.fields else {
+                    panic!("encountered a non-arbitrary layout during enum layout");
+                };
+                let mut fields = iter::zip(field_layouts, offsets).filter(|p| !p.0.is_zst());
+                let (field, offset) = match (fields.next(), fields.next()) {
+                    (None, None) => {
+                        common_prim_initialized_in_all_variants = false;
+                        continue;
+                    }
+                    (Some(pair), None) => pair,
+                    _ => {
+                        common_prim = None;
+                        break;
+                    }
+                };
+                let prim = match field.backend_repr {
+                    BackendRepr::Scalar(scalar) => {
+                        common_prim_initialized_in_all_variants &=
+                            matches!(scalar, Scalar::Initialized { .. });
+                        scalar.primitive()
+                    }
+                    _ => {
+                        common_prim = None;
+                        break;
+                    }
+                };
+                if let Some((old_prim, common_offset)) = common_prim {
+                    if offset != common_offset {
+                        common_prim = None;
+                        break;
+                    }
+                    let new_prim = match (old_prim, prim) {
+                        (x, y) if x == y => x,
+                        (p @ Primitive::Int(x, _), Primitive::Int(y, _)) if x == y => p,
+                        (p @ Primitive::Pointer(_), i @ Primitive::Int(..))
+                        | (i @ Primitive::Int(..), p @ Primitive::Pointer(_))
+                            if p.size(dl) == i.size(dl) && p.align(dl) == i.align(dl) =>
+                        {
+                            p
+                        }
+                        _ => {
+                            common_prim = None;
+                            break;
+                        }
+                    };
+                    common_prim = Some((new_prim, common_offset));
+                } else {
+                    common_prim = Some((prim, offset));
+                }
+            }
+            if let Some((prim, offset)) = common_prim {
+                let prim_scalar = if common_prim_initialized_in_all_variants {
+                    let size = prim.size(dl);
+                    assert!(size.bits() <= 128);
+                    Scalar::Initialized { value: prim, valid_range: WrappingRange::full(size) }
+                } else {
+                    Scalar::Union { value: prim }
+                };
+                let pair =
+                    LayoutData::<FieldIdx, VariantIdx>::scalar_pair(&self.cx, prim_scalar, tail_tag);
+                let pair_offsets = match pair.fields {
+                    FieldsShape::Arbitrary { ref offsets, ref in_memory_order } => {
+                        assert_eq!(in_memory_order.raw, [FieldIdx::new(0), FieldIdx::new(1)]);
+                        offsets
+                    }
+                    _ => panic!("encountered a non-arbitrary layout during enum layout"),
+                };
+                if pair_offsets[FieldIdx::new(0)] == *offset
+                    && pair_offsets[FieldIdx::new(1)] == tag_offset
+                    && align == pair.align.abi
+                    && size == pair.size
+                {
+                    abi = pair.backend_repr;
+                }
+            }
+
+            if matches!(abi, BackendRepr::Scalar(..) | BackendRepr::ScalarPair(..)) {
+                for variant in &mut layout_variants {
+                    if variant.fields.count() > 0
+                        && matches!(variant.backend_repr, BackendRepr::Memory { .. })
+                    {
+                        variant.backend_repr = abi;
+                        variant.size = cmp::max(variant.size, size);
+                        variant.align.abi = cmp::max(variant.align.abi, align);
+                    }
+                }
+            }
+
+            let largest_niche = Niche::from_scalar(dl, tag_offset, tail_tag);
+            let uninhabited = layout_variants.iter().all(|v| v.is_uninhabited());
+            let combined_seed = layout_variants
+                .iter()
+                .map(|v| v.randomization_seed)
+                .fold(repr.field_shuffle_seed, |acc, seed| acc.wrapping_add(seed));
+
+            Some(LayoutData {
+                variants: Variants::Multiple {
+                    tag: tail_tag,
+                    tag_encoding: TagEncoding::Direct,
+                    tag_field: FieldIdx::new(0),
+                    variants: layout_variants,
+                },
+                fields: FieldsShape::Arbitrary {
+                    offsets: [tag_offset].into(),
+                    in_memory_order: [FieldIdx::new(0)].into(),
+                },
+                largest_niche,
+                uninhabited,
+                backend_repr: abi,
+                align: AbiAlign::new(align),
+                size,
+                max_repr_align,
+                unadjusted_abi_align,
+                randomization_seed: combined_seed,
+            })
+        };
+
+        let tagged_layout = match tag_at_end_layout() {
+            Some(tail_tagged_layout) if tail_tagged_layout.size < tagged_layout.size => {
+                tail_tagged_layout
+            }
+            Some(tail_tagged_layout) if tail_tagged_layout.size == tagged_layout.size => {
+                let all_variants_have_payload =
+                    variants.iter().all(|fields| fields.iter().any(|field| !field.is_zst()));
+                let original_preserves_payload_scalar =
+                    if let BackendRepr::ScalarPair(_tag, payload) = tagged_layout.backend_repr {
+                        matches!(payload.primitive(), Primitive::Pointer(_))
+                            || payload.size(dl).bytes() > 4
+                            || Niche::from_scalar(dl, Size::ZERO, payload).is_some()
+                    } else {
+                        false
+                    };
+                if original_preserves_payload_scalar || !all_variants_have_payload {
+                    tagged_layout
+                } else {
+                    let tail_moves_payload_niches =
+                        if let Variants::Multiple { ref variants, .. } = tail_tagged_layout.variants
+                        {
+                            variants.iter().any(|variant| variant.largest_niche.is_some())
+                        } else {
+                            false
+                        };
+                    if tail_moves_payload_niches {
+                        tagged_layout
+                    } else {
+                        let tag_size = tag.size(dl);
+                        let tail_tag_size = match tail_tagged_layout.variants {
+                            Variants::Multiple { tag, .. } => tag.size(dl),
+                            _ => panic!("tag_at_end_layout must produce a multi-variant layout"),
+                        };
+                        let original_payload_space = tagged_layout.size - tag_size;
+                        let tail_payload_space = tail_tagged_layout.size - tail_tag_size;
+
+                        if tail_payload_space > original_payload_space {
+                            tail_tagged_layout
+                        } else {
+                            tagged_layout
+                        }
+                    }
+                }
+            }
+            _ => tagged_layout,
         };
 
         let best_layout = match (tagged_layout, niche_filling_layout) {

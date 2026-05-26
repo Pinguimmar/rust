@@ -26,3 +26,24 @@ enum E2 {
     A(i8, i32),
     B(S),
 }
+
+enum E3 {
+    A(i32, i8),
+    B(bool, i32),
+}
+
+enum E4 {
+    A(i8, i32),
+    B(bool, i32),
+}
+
+enum Inner {
+    A(i16),
+    B(i16),
+}
+
+enum E5 {
+    A(Inner),
+    B(i16, i8),
+    C(i8, i8),
+}
